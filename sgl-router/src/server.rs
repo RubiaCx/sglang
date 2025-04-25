@@ -1,26 +1,31 @@
 use crate::router::PolicyConfig;
 use crate::router::Router;
+use crate::service_discovery::{start_service_discovery, ServiceDiscoveryConfig};
 use actix_web::{
     error, get, post, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder,
 };
 use bytes::Bytes;
+use chrono::Local;
 use env_logger::Builder;
 use futures_util::StreamExt;
-use log::{info, LevelFilter};
+use log::{error, info, warn, LevelFilter};
+use reqwest::Client;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::spawn;
 
 #[derive(Debug)]
 pub struct AppState {
     router: Router,
-    client: reqwest::Client,
+    client: Client,
 }
 
 impl AppState {
     pub fn new(
         worker_urls: Vec<String>,
-        client: reqwest::Client,
+        client: Client,
         policy_config: PolicyConfig,
     ) -> Result<Self, String> {
         // Create router based on policy
@@ -148,13 +153,13 @@ pub struct ServerConfig {
     pub policy_config: PolicyConfig,
     pub verbose: bool,
     pub max_payload_size: usize,
+    pub service_discovery_config: Option<ServiceDiscoveryConfig>,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     // Initialize logger
     Builder::new()
         .format(|buf, record| {
-            use chrono::Local;
             writeln!(
                 buf,
                 "[Router (Rust)] {} - {} - {}",
@@ -181,7 +186,15 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         config.max_payload_size / (1024 * 1024)
     );
 
-    let client = reqwest::Client::builder()
+    // Log service discovery status
+    if let Some(service_discovery_config) = &config.service_discovery_config {
+        info!("🚧 Service discovery enabled");
+        info!("🚧 Selector: {:?}", service_discovery_config.selector);
+    } else {
+        info!("🚧 Service discovery disabled");
+    }
+
+    let client = Client::builder()
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .build()
         .expect("Failed to create HTTP client");
@@ -194,6 +207,30 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
     );
+
+    // Start the service discovery if enabled
+    if let Some(service_discovery_config) = config.service_discovery_config {
+        if service_discovery_config.enabled {
+            let worker_urls = Arc::clone(&app_state.router.get_worker_urls());
+
+            match start_service_discovery(service_discovery_config, worker_urls).await {
+                Ok(handle) => {
+                    info!("✅ Service discovery started successfully");
+
+                    // Spawn a task to handle the service discovery thread
+                    spawn(async move {
+                        if let Err(e) = handle.await {
+                            error!("Service discovery task failed: {:?}", e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to start service discovery: {}", e);
+                    warn!("Continuing without service discovery");
+                }
+            }
+        }
+    }
 
     info!("✅ Serving router on {}:{}", config.host, config.port);
     info!("✅ Serving workers on {:?}", config.worker_urls);

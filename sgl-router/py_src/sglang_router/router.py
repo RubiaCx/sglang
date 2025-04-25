@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Optional, Dict
 
 from sglang_router_rs import PolicyType
 from sglang_router_rs import Router as _Router
@@ -31,6 +31,12 @@ class Router:
         max_payload_size: Maximum payload size in bytes. Default: 4MB
         max_tree_size: Maximum size of the approximation tree for cache-aware routing. Default: 2^24
         verbose: Enable verbose logging. Default: False
+        service_discovery: Enable Kubernetes service discovery. When enabled, the router will
+            automatically discover worker pods based on the selector. Default: False
+        selector: Dictionary mapping of label keys to values for Kubernetes pod selection.
+            Example: {"app": "sglang-worker"}. Default: {}
+        service_discovery_port: Port to use for service discovery. The router will generate
+            worker URLs using this port. Default: 80
     """
 
     def __init__(
@@ -48,7 +54,13 @@ class Router:
         max_tree_size: int = 2**24,
         max_payload_size: int = 4 * 1024 * 1024,  # 4MB
         verbose: bool = False,
+        service_discovery: bool = False,
+        selector: Dict[str, str] = None,
+        service_discovery_port: int = 80,
     ):
+        if selector is None:
+            selector = {}
+            
         self._router = _Router(
             worker_urls=worker_urls,
             policy=policy,
@@ -63,6 +75,9 @@ class Router:
             max_tree_size=max_tree_size,
             max_payload_size=max_payload_size,
             verbose=verbose,
+            service_discovery=service_discovery,
+            selector=selector,
+            service_discovery_port=service_discovery_port,
         )
 
     def start(self) -> None:

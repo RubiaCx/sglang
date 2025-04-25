@@ -42,6 +42,11 @@ class RouterArgs:
     max_tree_size: int = 2**24
     max_payload_size: int = 4 * 1024 * 1024  # 4MB
     verbose: bool = False
+    
+    # Service discovery configuration
+    service_discovery: bool = False
+    selector: dict = dataclasses.field(default_factory=dict)
+    service_discovery_port: int = 80
 
     @staticmethod
     def add_cli_args(
@@ -142,6 +147,25 @@ class RouterArgs:
             action="store_true",
             help="Enable verbose logging",
         )
+        
+        # Service discovery configuration
+        parser.add_argument(
+            f"--{prefix}service-discovery",
+            action="store_true",
+            help="Enable Kubernetes service discovery",
+        )
+        parser.add_argument(
+            f"--{prefix}selector",
+            type=str,
+            nargs="+",
+            help="Label selector for Kubernetes service discovery (format: key1=value1 key2=value2)",
+        )
+        parser.add_argument(
+            f"--{prefix}service-discovery-port",
+            type=int,
+            default=RouterArgs.service_discovery_port,
+            help="Port to use for discovered worker pods",
+        )
 
     @classmethod
     def from_cli_args(
@@ -174,8 +198,22 @@ class RouterArgs:
             max_tree_size=getattr(args, f"{prefix}max_tree_size"),
             max_payload_size=getattr(args, f"{prefix}max_payload_size"),
             verbose=getattr(args, f"{prefix}verbose", False),
+            service_discovery=getattr(args, f"{prefix}service_discovery", False),
+            selector=cls._parse_selector(getattr(args, f"{prefix}selector", None)),
+            service_discovery_port=getattr(args, f"{prefix}service_discovery_port"),
         )
-
+        
+    @staticmethod
+    def _parse_selector(selector_list):
+        if not selector_list:
+            return {}
+        
+        selector = {}
+        for item in selector_list:
+            if "=" in item:
+                key, value = item.split("=", 1)
+                selector[key] = value
+        return selector
 
 def policy_from_str(policy_str: str) -> PolicyType:
     """Convert policy string to PolicyType enum."""
@@ -220,6 +258,9 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             max_tree_size=router_args.max_tree_size,
             max_payload_size=router_args.max_payload_size,
             verbose=router_args.verbose,
+            service_discovery=router_args.service_discovery,
+            selector=router_args.selector,
+            service_discovery_port=router_args.service_discovery_port,
         )
 
         router.start()

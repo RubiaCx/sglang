@@ -1,6 +1,8 @@
 use pyo3::prelude::*;
+use std::collections::HashMap;
 pub mod router;
 pub mod server;
+pub mod service_discovery;
 pub mod tree;
 
 #[pyclass(eq)]
@@ -26,6 +28,9 @@ struct Router {
     max_tree_size: usize,
     max_payload_size: usize,
     verbose: bool,
+    service_discovery: bool,
+    selector: HashMap<String, String>,
+    service_discovery_port: u16,
 }
 
 #[pymethods]
@@ -44,7 +49,10 @@ impl Router {
         eviction_interval_secs = 60,
         max_tree_size = 2usize.pow(24),
         max_payload_size = 4 * 1024 * 1024,
-        verbose = false
+        verbose = false,
+        service_discovery = false,
+        selector = HashMap::new(),
+        service_discovery_port = 80
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -60,6 +68,9 @@ impl Router {
         max_tree_size: usize,
         max_payload_size: usize,
         verbose: bool,
+        service_discovery: bool,
+        selector: HashMap<String, String>,
+        service_discovery_port: u16,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -75,6 +86,9 @@ impl Router {
             max_tree_size,
             max_payload_size,
             verbose,
+            service_discovery,
+            selector,
+            service_discovery_port,
         })
     }
 
@@ -99,6 +113,18 @@ impl Router {
             },
         };
 
+        // Create service discovery config if enabled
+        let service_discovery_config = if self.service_discovery {
+            Some(service_discovery::ServiceDiscoveryConfig {
+                enabled: true,
+                selector: self.selector.clone(),
+                check_interval: std::time::Duration::from_secs(60),
+                port: self.service_discovery_port,
+            })
+        } else {
+            None
+        };
+
         actix_web::rt::System::new().block_on(async move {
             server::startup(server::ServerConfig {
                 host: self.host.clone(),
@@ -107,6 +133,7 @@ impl Router {
                 policy_config,
                 verbose: self.verbose,
                 max_payload_size: self.max_payload_size,
+                service_discovery_config,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
