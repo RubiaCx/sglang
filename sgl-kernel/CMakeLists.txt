@@ -335,6 +335,8 @@ set(SOURCES
     "csrc/moe/fp8_blockwise_moe_kernel.cu"
     "csrc/moe/prepare_moe_input.cu"
 
+    "csrc/multimodal/rotary_embedding.cu"
+
     "csrc/quantization/gguf/gguf_kernel.cu"
     "csrc/speculative/eagle_utils.cu"
     "csrc/speculative/ngram_utils.cu"
