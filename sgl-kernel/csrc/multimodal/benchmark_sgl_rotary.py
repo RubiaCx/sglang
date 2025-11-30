@@ -1,108 +1,63 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
+Benchmark RoPE for flashinfer, sgl-kernel and vllm.
+"""
 
-import argparse
-import time
+from typing import Optional, Tuple, Union
+
 import numpy as np
 import torch
+import torch.nn as nn
+import triton
+from vllm.model_executor.layers.rotary_embedding import (
+    RotaryEmbedding as vLLMRotaryEmbedding,
+)
 
-# ---------- 选择内核入口：sgl_kernel 优先，回退本地 sgl_rotary ----------
-ROTARY_OP = None
+from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+from flashinfer.testing.utils import bench_gpu_time
+
+# Optional: sgl-kernel rotary embedding for comparison
+import os
+import sys
+
 try:
-    from sgl_kernel import rotary_embedding as _rotary
-    ROTARY_OP = _rotary
-    print("✓ 使用 sgl_kernel.rotary_embedding")
-except Exception as e1:
-    try:
-        import sgl_rotary  # 本目录编译产物
-        ROTARY_OP = sgl_rotary.rotary_embedding
-        print("✓ 使用本地模块 sgl_rotary.rotary_embedding")
-    except Exception as e2:
-        print("未找到 rotary kernel：既没有 sgl_kernel 也没有本地 sgl_rotary")
-        print("错误信息：", e1, " / ", e2)
-        raise SystemExit(1)
+    from sgl_kernel import rotary_embedding as sgl_rotary  
 
+    HAS_SGL_KERNEL = True
+except Exception:
+    sgl_rotary = None
+    HAS_SGL_KERNEL = False
 
-# ---------- 参考实现 ----------
-def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _candidates = [
+        os.path.join("/workspace/sglang/sgl-kernel/csrc/multimodal"),
+        os.path.normpath(
+            os.path.join(_here, "..", "..", "sglang", "sgl-kernel", "csrc", "multimodal")
+        ),
+    ]
+    for _path in _candidates:
+        so_path = os.path.join(_path, "sgl_rotary.so")
+        if os.path.exists(so_path):
+            if _path not in sys.path:
+                sys.path.append(_path)
+            try:
+                import sgl_rotary as _sgl_mod  # type: ignore[import]
 
-def _apply_rope_gptj(q, cos, sin):
-    # 参考：半维度拼接旋转
-    qf = q.float()
-    cos, sin = cos.float().unsqueeze(1), sin.float().unsqueeze(1)
-    x1, x2 = qf[..., : qf.shape[-1] // 2], qf[..., qf.shape[-1] // 2 :]
-    return (qf * cos) + (torch.cat((-x2, x1), dim=-1) * sin)
+                sgl_rotary = _sgl_mod.rotary_embedding
+                HAS_SGL_KERNEL = True
+                break
+            except Exception:
+                continue
 
-def _apply_rope_neox(q, cos, sin):
-    # 参考：偶/奇交织旋转
-    qf = q.float()
-    cos, sin = cos.float().unsqueeze(1), sin.float().unsqueeze(1)
-    q_even, q_odd = qf[..., ::2], qf[..., 1::2]
-    cos_e, sin_e = cos[..., ::2], sin[..., ::2]
-    rot_even = q_even * cos_e - q_odd * sin_e
-    rot_odd  = q_odd  * cos_e + q_even * sin_e
-    # 交织回去
-    out = torch.empty_like(qf)
-    out[..., ::2], out[..., 1::2] = rot_even, rot_odd
-    return out
-
-def detect_kernel_style():
-    import torch
-    from math import isfinite
-
-    # 小尺寸运行一次：cos=1,sin=0，然后 cos=0,sin=1
-    device, dtype = "cuda", torch.bfloat16
-    T, H, D = 4, 3, 16
-    q = torch.randn(T, H, D, device=device, dtype=dtype)
-    k = torch.randn(T, H, D, device=device, dtype=dtype)
-    cos0 = torch.ones(T, D, device=device, dtype=dtype)
-    sin0 = torch.zeros(T, D, device=device, dtype=dtype)
-    cos1 = torch.zeros(T, D, device=device, dtype=dtype)
-    sin1 = torch.ones(T, D, device=device, dtype=dtype)
-
-    # 引用可调用入口（统一使用全局已解析好的 ROTARY_OP）
-    ROT = ROTARY_OP
-
-    # 1) cos=1,sin=0 => 应该恒等
-    q1 = q.clone().float(); k1 = k.clone().float()
-    ROT(cos0.float(), sin0.float(), q1, k1, D, False)
-    assert torch.allclose(q1.to(dtype), q, atol=1e-6, rtol=1e-6), "kernel 非恒等：形状或数据布局不兼容"
-
-    # 2) cos=0,sin=1 => 取决于风格
-    q2 = q.clone().float(); k2 = k.clone().float()
-    ROT(cos1.float(), sin1.float(), q2, k2, D, False)  # 先用 False 调一次（开关谁真谁假稍后判断）
-
-    ref_gptj = _apply_rope_gptj(q, cos1, sin1)
-    ref_neox = _apply_rope_neox(q, cos1, sin1)
-
-    e_gptj = (q2.to(dtype) - ref_gptj).abs().max().item()
-    e_neox = (q2.to(dtype) - ref_neox).abs().max().item()
-
-    style = "gptj" if e_gptj < e_neox else "neox"
-    print(f"[detect] kernel 风格推断为: {style}  (max_err gptj={e_gptj:.3e}, neox={e_neox:.3e})")
-    return style
-
-def apply_rotary_pos_emb_ref(q, k, cos, sin, is_neox_style: bool):
-    q_dtype, k_dtype = q.dtype, k.dtype
-    if is_neox_style:
-        q_out = _apply_rope_neox(q, cos, sin)
-        k_out = _apply_rope_neox(k, cos, sin)
-    else:
-        q_out = _apply_rope_gptj(q, cos, sin)
-        k_out = _apply_rope_gptj(k, cos, sin)
-    return q_out.to(q_dtype), k_out.to(k_dtype)
-
-
-## 保留在本脚本内的函数都为测试/基准所需，移除未使用的参考路径以保持精简
-
-
-class RotaryEmbeddingRef(torch.nn.Module):
-    """只保留单测用到的能力：构造/缓存 cos_sin，不在此脚本里使用 cache 索引分支"""
-    def __init__(self, head_size: int, rotary_dim: int, max_position_embeddings: int, base: int,
-                 dtype: torch.dtype, is_neox_style: bool = False):
+class FlashInferRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
         super().__init__()
         self.head_size = head_size
         self.rotary_dim = rotary_dim
@@ -111,174 +66,271 @@ class RotaryEmbeddingRef(torch.nn.Module):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-    def forward_native(self, cos, sin, query, key):
-        return apply_rotary_pos_emb_ref(query, key, cos, sin, self.is_neox_style)
+        cache = self._compute_cos_sin_cache()
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    def forward_kernel_inplace(self, cos, sin, query, key):
-        cos, sin = cos.float().contiguous(), sin.float().contiguous()
-        query, key = query.float(), key.float()
-        ROTARY_OP(cos, sin, query, key, self.head_size, self.is_neox_style)
-        return query.to(self.dtype), key.to(self.dtype)
+    def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, self.rotary_dim, 2, dtype=torch.float) / self.rotary_dim
+            )
+        )
+        return inv_freq
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the cos and sin cache."""
+        inv_freq = self._compute_inv_freq(self.base)
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def _apply_rotary_emb(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        is_neox_style: bool,
+    ) -> torch.Tensor:
+        """
+        Args:
+            x: [num_tokens, num_heads, head_size]
+            cos: [num_tokens, head_size // 2]
+            sin: [num_tokens, head_size // 2]
+            is_neox_style: Whether to use the Neox-style or GPT-J-style rotary
+                positional embeddings.
+        """
+        cos = cos.unsqueeze(-2).to(x.dtype)
+        sin = sin.unsqueeze(-2).to(x.dtype)
+        if is_neox_style:
+            x1, x2 = torch.chunk(x, 2, dim=-1)
+        else:
+            x1 = x[..., ::2]
+            x2 = x[..., 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        if is_neox_style:
+            return torch.cat((o1, o2), dim=-1)
+        else:
+            return torch.stack((o1, o2), dim=-1).flatten(-2)
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        apply_rope_with_cos_sin_cache_inplace(
+            positions=positions,
+            query=query,
+            key=key,
+            head_size=self.head_size,
+            cos_sin_cache=self.cos_sin_cache,
+            is_neox=self.is_neox_style,
+        )
+        return query, key
 
 
-# ---------- 正确性（与 test_correctness 参数一致） ----------
-def run_correctness_cases(device="cuda"):
-    cases = [
-        (80, 80, int(1e6), int(1e6), False, torch.bfloat16, 32, 32, 16, 16),
-        (320, 230, int(1e6), int(1e6), False, torch.bfloat16, 32, 32, 16, 16),
-        (80, 80, int(1e6), int(1e6), True,  torch.bfloat16, 32, 32, 16, 16),
-    ]
-    for (head_size, rotary_dim, mpe, base, is_neox, dtype, bs, seqlen, Hq, Hkv) in cases:
-        rope = RotaryEmbeddingRef(head_size, rotary_dim, mpe, base, dtype, is_neox_style=USE_NEOX).to(device)
-        T = bs * seqlen
-        q = torch.randn(T, Hq, head_size, dtype=dtype, device=device)
-        k = torch.randn(T, Hkv, head_size, dtype=dtype, device=device)
-        cos = torch.randn(T, head_size, dtype=dtype, device=device)
-        sin = torch.randn(T, head_size, dtype=dtype, device=device)
-        q_ref, k_ref = rope.forward_native(cos, sin, q.clone(), k.clone())
-        q_out, k_out = rope.forward_kernel_inplace(cos, sin, q, k)
-        torch.testing.assert_close(q_ref, q_out, atol=1e-3, rtol=1e-3)
-        torch.testing.assert_close(k_ref, k_out, atol=1e-3, rtol=1e-3)
-    print("✓ 正确性通过：对齐 test_correctness")
+class SGLRotaryEmbedding(nn.Module):
+    """Use sgl-kernel rotary_embedding kernel for benchmark."""
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        num_q_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        super().__init__()
+        if not HAS_SGL_KERNEL:
+            raise RuntimeError("sgl_kernel is not available; cannot benchmark provider='sgl'")
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+
+        self._cached_positions: Optional[torch.Tensor] = None
+        self._cached_cos: Optional[torch.Tensor] = None
+        self._cached_sin: Optional[torch.Tensor] = None
+
+        self.register_buffer(
+            "cos_cache",
+            torch.randn(max_position_embeddings, head_size, dtype=dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "sin_cache",
+            torch.randn(max_position_embeddings, head_size, dtype=dtype),
+            persistent=False,
+        )
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            positions: [num_tokens]
+            query: [num_tokens, num_q_heads * head_size]
+            key: [num_tokens, num_kv_heads * head_size]
+        """
+        if (
+            self._cached_positions is None
+            or self._cached_positions.device != positions.device
+            or self._cached_positions.dtype != positions.dtype
+            or not torch.equal(self._cached_positions, positions)
+        ):
+            cos = self.cos_cache.index_select(0, positions)
+            sin = self.sin_cache.index_select(0, positions)
+            self._cached_positions = positions.detach().clone()
+            self._cached_cos = cos
+            self._cached_sin = sin
+        else:
+            cos = self._cached_cos
+            sin = self._cached_sin
+
+        num_tokens = positions.shape[0]
+        q = query.view(num_tokens, self.num_q_heads, self.head_size)
+        k = key.view(num_tokens, self.num_kv_heads, self.head_size)
+
+        if hasattr(sgl_rotary, "rotary_embedding"):
+            _rotary = sgl_rotary.rotary_embedding  # type: ignore[attr-defined]
+        else:
+            _rotary = sgl_rotary
+
+        _rotary(
+            cos,
+            sin,
+            q,
+            k,
+            self.head_size,
+            self.is_neox_style,
+        )
+
+        query_out = q.view(num_tokens, self.num_q_heads * self.head_size)
+        key_out = k.view(num_tokens, self.num_kv_heads * self.head_size)
+        return query_out, key_out
 
 
-# ---------- 基准（与 test_rotary_embedding_benchmark 对齐） ----------
-def bench_one(
-    *,
-    head_size=80,
-    rotary_dim=80,
-    is_neox_style=False,
-    dtype=torch.bfloat16,
-    batch_size=1,
-    seq_len=8840,
-    num_q_heads=16,
-    num_kv_heads=16,
-    warmup_rounds=5,
-    bench_rounds=20000,
-    reset_each_iter=False,  # 默认 False：与 pytest 一致（不恢复输入）
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["seq_len"],
+        x_vals=[
+            2,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256,
+            512,
+            1024,
+            2048,
+            4096,
+            8192,
+            16384,
+            32768,
+            65536,
+        ],
+        line_arg="provider",
+        line_vals=["flashinfer", "vllm_native", "vllm", "sgl"],
+        line_names=["FlashInfer", "vLLM_Native", "vLLM", "SGL"],
+        styles=[("blue", "-"), ("red", "-"), ("green", "-"), ("black", "-")],
+        ylabel="Latency (ms)",
+        plot_name="rope-latency",
+        args={
+            "head_size": 4096 // 32,
+            "rotary_dim": 4096 // 32,
+            "max_position_embeddings": 65536,
+            "base": 500000,
+            "is_neox_style": True,
+            "dtype": torch.bfloat16,
+            "device": "cuda",
+            "batch_size": 2,
+            "num_q_heads": 32,
+            "num_kv_heads": 8,
+        },
+    )
+)
+def benchmark(
+    provider,
+    head_size,
+    rotary_dim,
+    max_position_embeddings,
+    base,
+    is_neox_style,
+    dtype,
+    device,
+    batch_size,
+    seq_len,
+    num_q_heads,
+    num_kv_heads,
 ):
-    device = "cuda"
-    T = batch_size * seq_len
+    print(
+        f"provider: {provider}, head_size: {head_size}, rotary_dim: {rotary_dim}, max_position_embeddings: {max_position_embeddings}, base: {base}, is_neox_style: {is_neox_style}, dtype: {dtype}, device: {device}, batch_size: {batch_size}, seq_len: {seq_len}, num_q_heads: {num_q_heads}, num_kv_heads: {num_kv_heads}"
+    )
 
-    rope = RotaryEmbeddingRef(head_size, rotary_dim, int(1e6), int(1e6), dtype, is_neox_style).to(device)
+    rope_forward = None
 
-    q = torch.randn(T, num_q_heads, head_size, dtype=dtype, device=device)
-    k = torch.randn(T, num_kv_heads, head_size, dtype=dtype, device=device)
-    cos = torch.randn(T, head_size, dtype=dtype, device=device)
-    sin = torch.randn(T, head_size, dtype=dtype, device=device)
+    if provider == "vllm":
+        rope = vLLMRotaryEmbedding(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        ).to(device)
+        rope_forward = rope.forward_cuda
+    elif provider == "flashinfer":
+        rope = FlashInferRotaryEmbedding(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        ).to(device)
+        rope_forward = rope.forward_cuda
+    elif provider == "vllm_native":
+        rope = vLLMRotaryEmbedding(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
+        ).to(device)
+        rope_forward = rope.forward_native
+    elif provider == "sgl":
+        rope = SGLRotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+            num_q_heads,
+            num_kv_heads,
+        ).to(device)
+        rope_forward = rope.forward_cuda
 
-    if reset_each_iter:
-        q0, k0 = q.clone(), k.clone()
-        cos0, sin0 = cos.clone(), sin.clone()
+    pos_ids = torch.arange(seq_len, device=device).repeat(batch_size)
+    query = torch.randn(
+        batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device
+    )
+    key = torch.randn(
+        batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
+    )
 
-    for _ in range(warmup_rounds):
-        if reset_each_iter:
-            q.copy_(q0); k.copy_(k0); cos.copy_(cos0); sin.copy_(sin0)
-        rope.forward_kernel_inplace(cos, sin, q, k)
-        torch.cuda.synchronize()
-
-    times = []
-    for _ in range(bench_rounds):
-        if reset_each_iter:
-            q.copy_(q0); k.copy_(k0); cos.copy_(cos0); sin.copy_(sin0)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        rope.forward_kernel_inplace(cos, sin, q, k)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        times.append((t1 - t0) * 1e6)  # us
-
-    a = np.array(times, dtype=np.float64)
-    stats = dict(mean=a.mean(), std=a.std(), min=a.min(), max=a.max(), median=np.median(a), rounds=bench_rounds)
-    return stats
-
-
-def accuracy_one(
-    *,
-    head_size=80,
-    rotary_dim=80,
-    is_neox_style=False,
-    dtype=torch.bfloat16,
-    batch_size=1,
-    seq_len=8840,
-    num_q_heads=16,
-    num_kv_heads=16,
-):
-    """对齐 benchmark 规模做一次精度对比，返回误差指标。"""
-    device = "cuda"
-    T = batch_size * seq_len
-    rope = RotaryEmbeddingRef(head_size, rotary_dim, int(1e6), int(1e6), dtype, is_neox_style).to(device)
-    q = torch.randn(T, num_q_heads, head_size, dtype=dtype, device=device)
-    k = torch.randn(T, num_kv_heads, head_size, dtype=dtype, device=device)
-    cos = torch.randn(T, head_size, dtype=dtype, device=device)
-    sin = torch.randn(T, head_size, dtype=dtype, device=device)
-    q_ref, k_ref = rope.forward_native(cos, sin, q.clone(), k.clone())
-    q_out, k_out = rope.forward_kernel_inplace(cos, sin, q.clone(), k.clone())
-    q_err = (q_ref - q_out).abs()
-    k_err = (k_ref - k_out).abs()
-    return {
-        "q_max_abs": float(q_err.max().item()),
-        "q_mean_abs": float(q_err.mean().item()),
-        "k_max_abs": float(k_err.max().item()),
-        "k_mean_abs": float(k_err.mean().item()),
-    }
-
-
-def main():
-    style = detect_kernel_style()
-    global USE_NEOX
-    USE_NEOX = (style == "neox")
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--reset-each-iter", action="store_true", help="每轮恢复输入（默认不恢复，以匹配 pytest 行为）")
-    args = parser.parse_args()
-
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA 不可用")
-
-    # 先做正确性（与 test_correctness 对齐）
-    run_correctness_cases()
-
-    # 三组基准（与 test_rotary_embedding_benchmark 三组参数一致/等价）
-    configs = [
-        dict(name="80/False/bs=1,seqlen=8840", head_size=80, rotary_dim=80, is_neox_style=False,
-             dtype=torch.bfloat16, batch_size=1, seq_len=8840, num_q_heads=16, num_kv_heads=16),
-        dict(name="80/False/bs=1,seqlen=4000", head_size=80, rotary_dim=80, is_neox_style=False,
-             dtype=torch.bfloat16, batch_size=1, seq_len=4000, num_q_heads=16, num_kv_heads=16),
-        dict(name="80/True/ bs=8,seqlen=8840", head_size=80, rotary_dim=80, is_neox_style=True,
-             dtype=torch.bfloat16, batch_size=8, seq_len=8840, num_q_heads=16, num_kv_heads=16),
-    ]
-
-    print("\n=== Rotary Embedding Kernel Benchmark（us） ===")
-    all_rows = []
-    for i, cfg in enumerate(configs, 1):
-        name = cfg.pop("name")
-        print(f"\n[Case {i}] {name}")
-        s = bench_one(**cfg, warmup_rounds=5, bench_rounds=20000,
-                      reset_each_iter=args.reset_each_iter)
-        print(f"  Min    {s['min']:10.2f} us")
-        print(f"  Max    {s['max']:10.2f} us")
-        print(f"  Mean   {s['mean']:10.2f} us")
-        print(f"  Median {s['median']:10.2f} us")
-        print(f"  StdDev {s['std']:10.2f} us")
-        print(f"  Rounds {s['rounds']}")
-        # 精度
-        acc = accuracy_one(**cfg)
-        # 吞吐（token/s）
-        T = cfg["batch_size"] * cfg["seq_len"]
-        tok_per_sec = 1e6 * T / s["mean"]
-        all_rows.append((name, s, acc, tok_per_sec))
-
-    # 汇总表格：精度 + 性能
-    print("\n=== 汇总：精度与性能对比 ===")
-    header = f"{'Case':<28} {'Mean(us)':>10} {'Min(us)':>10} {'Std(us)':>10} {'Tok/s':>12}  {'Q_max':>9} {'Q_mean':>9} {'K_max':>9} {'K_mean':>9}"
-    print(header)
-    print("-" * len(header))
-    for name, s, acc, tps in all_rows:
-        print(f"{name:<28} {s['mean']:10.2f} {s['min']:10.2f} {s['std']:10.2f} {tps:12.0f}  "
-              f"{acc['q_max_abs']:9.3e} {acc['q_mean_abs']:9.3e} {acc['k_max_abs']:9.3e} {acc['k_mean_abs']:9.3e}")
-    print("\n说明：默认与 pytest-benchmark 语义一致（不恢复输入；就地更新）。"
-          "如需逐轮恢复输入以便横向对比，加 --reset-each-iter。")
-
+    measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
+    ms = np.median(measurements)
+    min_ms = np.percentile(measurements, 20)
+    max_ms = np.percentile(measurements, 80)
+    return ms, min_ms, max_ms
 
 if __name__ == "__main__":
-    main()
+    benchmark.run(print_data=True)

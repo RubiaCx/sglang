@@ -20,7 +20,7 @@
 #include <torch/all.h>
 
 #include <cmath>
-#include <flashinfer/vec_dtypes.cuh>
+// #include <flashinfer/vec_dtypes.cuh>
 
 #include "utils.h"
 

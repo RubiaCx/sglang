@@ -121,6 +121,28 @@ limitations under the License.
     }                                                                                    \
   }()
 
+#ifndef SGLANG_DISPATCH_FLOATING_TYPES
+#define SGLANG_DISPATCH_FLOATING_TYPES(TYPE, NAME, ...)                                     \
+  [&] {                                                                                     \
+    switch (TYPE) {                                                                         \
+      case at::ScalarType::Float: {                                                         \
+        using scalar_t = float;                                                             \
+        return __VA_ARGS__();                                                               \
+      }                                                                                     \
+      case at::ScalarType::Half: {                                                          \
+        using scalar_t = at::Half;                                                          \
+        return __VA_ARGS__();                                                               \
+      }                                                                                     \
+      case at::ScalarType::BFloat16: {                                                      \
+        using scalar_t = at::BFloat16;                                                      \
+        return __VA_ARGS__();                                                               \
+      }                                                                                     \
+      default:                                                                              \
+        AT_ERROR(#NAME, " not implemented for '", toString(TYPE), "'");                     \
+    }                                                                                       \
+  }()
+#endif  // SGLANG_DISPATCH_FLOATING_TYPES
+
 #define _DISPATCH_SWITCH(var_name, cond, ...)                                           \
   [&]() -> bool {                                                                       \
     switch (cond) {                                                                     \
