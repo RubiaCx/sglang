@@ -95,6 +95,22 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
   m.impl("apply_rope_pos_ids_cos_sin_cache", torch::kCUDA, &apply_rope_pos_ids_cos_sin_cache);
 
   m.def(
+			"apply_rope_pos_ids(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, "
+			"Tensor pos_ids, int rotary_dim, bool interleave, float rope_scale, float rope_theta) -> ()");
+	m.impl("apply_rope_pos_ids", torch::kCUDA, &apply_rope_pos_ids);
+
+	m.def(
+			"apply_rope_with_indptr(Tensor q, Tensor k, Tensor! q_rope, Tensor! k_rope, "
+			"Tensor indptr, Tensor offsets, int rotary_dim, bool interleave, float rope_scale, float rope_theta) -> ()");
+	m.impl("apply_rope_with_indptr", torch::kCUDA, &apply_rope_with_indptr);
+
+	m.def(
+			"rope_quantize(Tensor q_rope_in, Tensor k_rope_in, Tensor q_nope_in, Tensor k_nope_in, "
+			"Tensor! q_rope_out, Tensor! k_rope_out, Tensor! q_nope_out, Tensor! k_nope_out, "
+			"Tensor cos_sin_cache, Tensor pos_ids, float quant_scale_q, float quant_scale_kv, bool interleave) -> ()");
+	m.impl("rope_quantize", torch::kCUDA, &rope_quantize);
+
+  m.def(
       "downcast_fp8(Tensor k, Tensor v, Tensor k_out, Tensor v_out, Tensor k_scale, Tensor v_scale, Tensor loc, int "
       "mult, int offset, int cuda_stream) -> ()");
   m.impl("downcast_fp8", torch::kCUDA, &downcast_fp8);

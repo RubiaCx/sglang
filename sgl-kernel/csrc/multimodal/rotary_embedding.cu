@@ -1,9 +1,6 @@
 /*
  * Rotary Positional Embedding (RoPE) CUDA Kernel
  *
- * vLLM-style interface with separate cos/sin tensors.
- * Adapted from vLLM's rotary_embedding implementation.
- *
  * Copyright 2025 SGLang Team. All Rights Reserved.
  * Licensed under the Apache License, Version 2.0
  */
@@ -44,7 +41,6 @@ __global__ void rotary_embedding_neox_kernel(
     float cos_val = static_cast<float>(cos_cache[cs_idx]);
     float sin_val = static_cast<float>(sin_cache[cs_idx]);
 
-    // GPT-NeoX style: x' = x * cos - y * sin, y' = y * cos + x * sin
     float x_f = static_cast<float>(query[x_idx]);
     float y_f = static_cast<float>(query[y_idx]);
     query[x_idx] = static_cast<scalar_t>(x_f * cos_val - y_f * sin_val);
@@ -110,7 +106,6 @@ __global__ void rotary_embedding_gptj_kernel(
     query[y_idx] = static_cast<scalar_t>(y_f * sin_val + x_f * cos_val);
   }
 
-  // Process key
   if (key != nullptr) {
     const int k_total = num_tokens * num_kv_heads * embed_dim;
     const int k_idx = idx - q_total;
@@ -161,7 +156,6 @@ void rotary_embedding(
   TORCH_CHECK(sin_cache.size(0) == num_tokens, "sin_cache num_tokens mismatch");
   TORCH_CHECK(sin_cache.size(1) == cos_cache.size(1), "cos/sin cache size mismatch");
 
-  // Handle key tensor
   at::Tensor key_tensor;
   int num_kv_heads = 0;
   bool has_key = key.has_value() && key->defined();
@@ -175,7 +169,6 @@ void rotary_embedding(
 
   const int embed_dim = rotary_dim / 2;
 
-  // Total threads needed: max of query and key processing
   const int q_work = num_tokens * num_heads * embed_dim;
   const int k_work = has_key ? num_tokens * num_kv_heads * embed_dim : 0;
   const int total_work = q_work + k_work;
@@ -188,7 +181,6 @@ void rotary_embedding(
   AT_DISPATCH_FLOATING_TYPES_AND2(
       at::ScalarType::Half, at::ScalarType::BFloat16, query.scalar_type(), "rotary_embedding", [&] {
         scalar_t* key_ptr = has_key ? key_tensor.data_ptr<scalar_t>() : nullptr;
-
         if (is_neox) {
           rotary_embedding_neox_kernel<scalar_t><<<num_blocks, block_size, 0, stream>>>(
               query.data_ptr<scalar_t>(),

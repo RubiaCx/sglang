@@ -1,6 +1,4 @@
 #!/bin/bash
-# Compile the rotary_embedding kernel (vLLM-style, separate cos/sin)
-
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -18,21 +16,48 @@ if [ -z "$GPU_ARCH" ]; then
 fi
 
 echo "=============================================="
-echo "Compiling rotary_embedding kernel ..."
+echo "Compiling rotary_embedding kernel (v2) ..."
 echo "Python include: $PYTHON_INCLUDE"
 echo "Torch include: $TORCH_INCLUDE"
 echo "GPU architecture: sm_${GPU_ARCH}"
 echo "=============================================="
 
-# Compile
+# Project root (for include/utils.h, etc.)
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Optional: FlashInfer headers if installed via Python
+FLASHINFER_INCLUDE=$(python - << 'EOF'
+try:
+    import flashinfer, os
+    inc = getattr(flashinfer, "get_include", None)
+    if inc is not None:
+        print(inc())
+    else:
+        # Fall back to package dir/include
+        print(os.path.join(os.path.dirname(flashinfer.__file__), "include"))
+except Exception:
+    pass
+EOF
+)
+
+NVCC_INCLUDES=(
+    "-I$PYTHON_INCLUDE"
+    "-I$TORCH_INCLUDE"
+    "-I$TORCH_INCLUDE_CSRC"
+    "-I$PROJECT_ROOT/include"
+    "-I/usr/local/cuda/include"
+)
+
+if [ -n "$FLASHINFER_INCLUDE" ]; then
+    NVCC_INCLUDES+=("-I$FLASHINFER_INCLUDE")
+    echo "Using FlashInfer include: $FLASHINFER_INCLUDE"
+fi
+
 nvcc -std=c++17 -O3 --shared -Xcompiler -fPIC \
     -DTORCH_EXTENSION_NAME=rotary_embedding \
-    -I"$PYTHON_INCLUDE" \
-    -I"$TORCH_INCLUDE" \
-    -I"$TORCH_INCLUDE_CSRC" \
-    -I/usr/local/cuda/include \
+    "${NVCC_INCLUDES[@]}" \
     -gencode arch=compute_${GPU_ARCH},code=sm_${GPU_ARCH} \
-    rotary_embedding.cu \
+    rotary_embedding2.cu \
     -L"$TORCH_LIB" \
     -ltorch -ltorch_python -lc10 -lc10_cuda \
     -o rotary_embedding.so
