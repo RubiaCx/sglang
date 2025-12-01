@@ -718,6 +718,14 @@ void top_p_sampling_from_probs(
 void top_k_mask_logits(
     at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
+void rotary_embedding(
+    at::Tensor& cos_cache, 
+    at::Tensor& sin_cache, 
+    at::Tensor& query,  
+    const std::optional<at::Tensor>& key, 
+    int64_t head_size,
+    bool is_neox);
+    
 namespace flash {
 /*
  * From fa2 sparse

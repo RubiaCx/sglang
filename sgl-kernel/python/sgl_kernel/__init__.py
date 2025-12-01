@@ -101,11 +101,7 @@ from sgl_kernel.quantization import (
     ggml_mul_mat_a8,
     ggml_mul_mat_vec_a8,
 )
-from sgl_kernel.rope import (
-    RotaryEmbedding,
-    RotaryEmbeddingWithScaling,
-    SGLangRotaryEmbedding,
-)
+from sgl_kernel.rotary_embedding import rotary_embedding
 from sgl_kernel.sampling import (
     min_p_sampling_from_probs,
     top_k_mask_logits,

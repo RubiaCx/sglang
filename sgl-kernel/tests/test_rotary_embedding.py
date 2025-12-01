@@ -10,7 +10,6 @@ from sgl_kernel.testing.rotary_embedding import (
     create_inputs,
 )
 
-
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads, save_kv_cache",
     [
