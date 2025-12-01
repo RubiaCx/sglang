@@ -2,6 +2,95 @@
 
 基于 FlashInfer 优化技术的 Rotary Position Embedding (RoPE) 实现。
 
+## 各项目 RoPE 实现对比
+
+### 接口总览
+
+| 项目 | 接口 | 输入格式 | 特点 |
+|------|------|----------|------|
+| **vLLM** | `rotary_embedding(cos, sin, query, key, head_size, is_neox)` | 分开的 cos/sin | in-place, 2D input |
+| **FlashInfer** | `apply_rope_with_cos_sin_cache_inplace(positions, query, key, head_size, cos_sin_cache, is_neox)` | 合并 cache + pos_ids | in-place, 2D input |
+| **sgl_kernel** | `rotary_embedding` | 分开的 cos/sin | vLLM 兼容 |
+| **sgl_kernel** | `apply_rope_with_cos_sin_cache_inplace` | 合并 cache + pos_ids | FlashInfer 兼容 |
+| **本实现 (rope.cu)** | `apply_rope_pos_ids_cos_sin_cache` | 合并 cache + pos_ids | 3D input, 支持 out-of-place |
+| **本实现 (rope.cu)** | `apply_rope_pos_ids` | 运行时计算 cos/sin | 无需 cache |
+| **本实现 (rope.cu)** | `apply_rope` | indptr + offset | variable-length batch |
+| **本实现 (rope.cu)** | `rope_quantize` | RoPE + FP8 量化 | MLA/DeepSeek 专用 |
+| **本实现 (rotary_embedding.cu)** | `rotary_embedding` | 分开的 cos/sin | vLLM 兼容, NEOX/GPT-J |
+
+### 详细说明
+
+#### 1. vLLM 的实现
+
+```python
+# python/sgl_kernel/rotary_embedding.py
+from sgl_kernel import rotary_embedding
+
+rotary_embedding(
+    cos: torch.Tensor,      # (seq_len, rotary_dim // 2) - 从 cache 索引得到
+    sin: torch.Tensor,      # (seq_len, rotary_dim // 2) - 从 cache 索引得到
+    query: torch.Tensor,    # (num_tokens, num_heads * head_size) - 2D, in-place 修改
+    key: torch.Tensor,      # (num_tokens, num_heads * head_size) - 2D, in-place 修改
+    head_size: int,
+    is_neox: bool,          # True = NEOX style, False = GPT-J style
+)
+```
+
+**特点**：需要调用方先根据 positions 索引 cos/sin cache。
+
+#### 2. FlashInfer 的实现
+
+```python
+from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
+
+apply_rope_with_cos_sin_cache_inplace(
+    positions: torch.Tensor,     # (num_tokens,) - 直接传 position ids
+    query: torch.Tensor,         # (num_tokens, num_heads * head_size) - 2D, in-place
+    key: torch.Tensor,           # (num_tokens, num_heads * head_size) - 2D, in-place
+    head_size: int,
+    cos_sin_cache: torch.Tensor, # (max_seq_len, rotary_dim) - [cos | sin] 格式
+    is_neox: bool = True,
+)
+```
+
+**特点**：内部根据 positions 索引 cache，更方便使用。
+
+#### 3. sgl_kernel 的实现
+
+```python
+
+from sgl_kernel.rotary_embedding import rotary_embedding
+rotary_embedding(cos, sin, query, key, head_size, is_neox)
+
+from sgl_kernel.elementwise import apply_rope_with_cos_sin_cache_inplace
+apply_rope_with_cos_sin_cache_inplace(
+    positions, query, key, head_size, cos_sin_cache, is_neox,
+    fused_set_kv_buffer_arg=None,  # 可选: fused KV cache 写入
+    enable_pdl=None,               # 可选: PDL 优化
+)
+```
+
+**底层 C++ API**:
+```cpp
+// 12 个参数 (已安装版本)
+torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache(
+    q, k, q_rope, k_rope, cos_sin_cache, pos_ids,
+    interleave, enable_pdl,
+    v, k_buffer, v_buffer, kv_cache_loc  // 可选, 用于 fused KV cache
+)
+```
+
+### 输入格式差异
+
+| 实现 | Query/Key Shape | Position IDs |
+|------|-----------------|--------------|
+| vLLM | `(nnz, num_heads * head_size)` - 2D | 不需要 (已索引 cos/sin) |
+| FlashInfer | `(nnz, num_heads * head_size)` - 2D | `(nnz,)` int64 |
+| sgl_kernel | `(nnz, num_heads * head_size)` - 2D | `(nnz,)` int64 |
+| 本实现 | `(nnz, num_heads, head_size)` - 3D | `(nnz,)` int32/int64 |
+
+---
+
 ## 背景
 
 ### 性能问题
@@ -28,12 +117,26 @@
 
 ```
 sgl-kernel/csrc/multimodal/
-├── rope_kernels.cuh    # 核心 CUDA kernel 实现
-├── rope.cu             # PyTorch 绑定
-├── compile.sh          # 编译脚本
-├── test_rope.py        # 测试和 benchmark
-└── README.md           # 本文档
+├── rope_kernels.cuh              # FlashInfer 风格 kernel (合并 cos_sin_cache)
+├── rope.cu                       # FlashInfer 风格 PyTorch 绑定
+├── compile.sh                    # 编译 rope.so
+├── test_rope.py                  # 测试 rope.so
+├── bench_rope.py                 # 性能测试 rope.so
+│
+├── rotary_embedding.cu           # vLLM 风格 kernel (分离 cos/sin)
+├── compile_rotary_embedding.sh   # 编译 rotary_embedding.so
+├── test_rotary_embedding.py      # 测试 rotary_embedding.so
+├── bench_rotary.py               # 性能测试 (vLLM vs sgl_kernel)
+│
+└── README.md                     # 本文档
 ```
+
+### 两种实现的区别
+
+| 实现 | 文件 | 接口风格 | cos/sin 格式 | 典型用户 |
+|------|------|----------|--------------|----------|
+| FlashInfer 风格 | `rope.cu` | `apply_rope_pos_ids_cos_sin_cache(q, k, q_out, k_out, cos_sin_cache, pos_ids)` | 合并 `[cos..., sin...]` | FlashInfer, sgl_kernel |
+| vLLM 风格 | `rotary_embedding.cu` | `rotary_embedding(cos, sin, query, key, head_size, is_neox)` | 分离 cos, sin | vLLM, sgl_kernel |
 
 ## API 设计
 
@@ -110,6 +213,56 @@ rope.rope_quantize(
     interleave: bool = False
 )
 ```
+
+---
+
+## rotary_embedding.cu (vLLM 风格)
+
+vLLM 兼容的分离 cos/sin 接口。
+
+### 编译
+
+```bash
+cd sgl-kernel/csrc/multimodal
+bash compile_rotary_embedding.sh
+```
+
+### API
+
+```python
+import rotary_embedding
+
+rotary_embedding.rotary_embedding(
+    cos: torch.Tensor,      # (num_tokens, rotary_dim/2), 已按 positions 索引
+    sin: torch.Tensor,      # (num_tokens, rotary_dim/2), 已按 positions 索引
+    query: torch.Tensor,    # (num_tokens, num_heads * head_size), in-place 修改
+    key: torch.Tensor,      # (num_tokens, num_kv_heads * head_size), in-place 修改, 可为 None
+    head_size: int,
+    is_neox: bool = True    # True = NeoX style (pairs at 0,1,2,3...), False = GPT-J style
+)
+```
+
+### 测试
+
+```bash
+python test_rotary_embedding.py
+```
+
+### 与 sgl_kernel.rotary_embedding 对比
+
+两者接口完全一致，可直接替换：
+
+```python
+# sgl_kernel 已有实现
+from sgl_kernel.rotary_embedding import rotary_embedding
+rotary_embedding(cos, sin, query, key, head_size, is_neox)
+
+# 本实现 (编译后)
+import rotary_embedding
+rotary_embedding.rotary_embedding(cos, sin, query, key, head_size, is_neox)
+```
+
+---
 
 ## 核心优化技术
 
@@ -204,8 +357,26 @@ chmod +x compile.sh
 ### 测试
 
 ```bash
+# 测试优化后的实现
 python test_rope.py
+
+# Benchmark 对比 (需要安装 vllm, flashinfer, sgl_kernel)
+python bench_rope.py
 ```
+
+### Benchmark 覆盖的实现
+
+`bench_rope.py` 支持以下 provider:
+
+| Provider | 说明 | 依赖 |
+|----------|------|------|
+| `flashinfer` | FlashInfer 原生实现 | `pip install flashinfer` |
+| `vllm` | vLLM CUDA 实现 | `pip install vllm` |
+| `vllm_native` | vLLM PyTorch 原生实现 | `pip install vllm` |
+| `sgl_existing` | sgl_kernel 已有实现 | `pip install sgl-kernel` |
+| `sgl_opt` | 本项目优化实现 | `bash compile.sh` |
+| `sgl_opt_inplace` | 本项目优化实现 (in-place) | `bash compile.sh` |
+| `sgl_opt_onthefly` | 本项目优化实现 (运行时计算) | `bash compile.sh` |
 
 ### 集成使用
 

@@ -1,12 +1,3 @@
-"""
-Benchmark RoPE for FlashInfer, vLLM, and SGLang optimized kernels.
-
-Usage:
-$ pip install vllm flashinfer
-$ bash compile.sh  # 编译 rope.so
-$ python bench_rope.py
-"""
-
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -28,12 +19,9 @@ if _here not in sys.path:
 try:
     import rope as rope_optimized
     HAS_ROPE_OPTIMIZED = True
-    print(f"✓ Loaded optimized rope module from {_here}")
 except ImportError as e:
     rope_optimized = None
     HAS_ROPE_OPTIMIZED = False
-    print(f"✗ Could not load optimized rope module: {e}")
-    print("  Run 'bash compile.sh' first to build rope.so")
 
 try:
     from sgl_kernel import rotary_embedding as sgl_rotary_old
@@ -41,6 +29,14 @@ try:
 except Exception:
     sgl_rotary_old = None
     HAS_SGL_KERNEL_OLD = False
+
+HAS_SGL_KERNEL_EXISTING = False
+try:
+    import sgl_kernel
+    if hasattr(torch.ops, 'sgl_kernel') and hasattr(torch.ops.sgl_kernel, 'apply_rope_pos_ids_cos_sin_cache'):
+        HAS_SGL_KERNEL_EXISTING = True
+except Exception:
+    pass
 
 
 class FlashInferRotaryEmbedding(nn.Module):
@@ -75,7 +71,6 @@ class FlashInferRotaryEmbedding(nn.Module):
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
         t = torch.arange(self.max_position_embeddings, dtype=torch.float)
 
@@ -133,7 +128,6 @@ class SGLOptimizedRotaryEmbedding(nn.Module):
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
-        """Compute the cos and sin cache (fp32)."""
         inv_freq = 1.0 / (
             self.base
             ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim)
@@ -153,24 +147,14 @@ class SGLOptimizedRotaryEmbedding(nn.Module):
         key: torch.Tensor,
         offsets: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            positions: [num_tokens], int32/int64
-            query: [num_tokens, num_q_heads * head_size]
-            key: [num_tokens, num_kv_heads * head_size]
-        """
         num_tokens = positions.shape[0]
         
-        # Reshape to 3D: (num_tokens, num_heads, head_size)
         q = query.view(num_tokens, self.num_q_heads, self.head_size)
         k = key.view(num_tokens, self.num_kv_heads, self.head_size)
         
-        # 输出 tensors
         q_out = torch.empty_like(q)
         k_out = torch.empty_like(k)
         
-        # 调用优化后的 kernel
-        # interleave=False 对应 NEOX style (is_neox_style=True)
         rope_optimized.apply_rope_pos_ids_cos_sin_cache(
             q, k, q_out, k_out,
             self.cos_sin_cache,
@@ -178,7 +162,6 @@ class SGLOptimizedRotaryEmbedding(nn.Module):
             interleave=not self.is_neox_style,  # NEOX style = interleave False
         )
         
-        # 展平成与 vLLM / FlashInfer 一致的形状
         query_out = q_out.view(num_tokens, self.num_q_heads * self.head_size)
         key_out = k_out.view(num_tokens, self.num_kv_heads * self.head_size)
         return query_out, key_out
@@ -234,11 +217,9 @@ class SGLOptimizedRotaryEmbeddingInplace(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         num_tokens = positions.shape[0]
         
-        # Reshape to 3D: (num_tokens, num_heads, head_size)
         q = query.view(num_tokens, self.num_q_heads, self.head_size)
         k = key.view(num_tokens, self.num_kv_heads, self.head_size)
         
-        # In-place: 输出和输入是同一个 tensor
         rope_optimized.apply_rope_pos_ids_cos_sin_cache(
             q, k, q, k,  # in-place
             self.cos_sin_cache,
@@ -303,10 +284,89 @@ class SGLOptimizedRotaryEmbeddingOnTheFly(nn.Module):
         return query_out, key_out
 
 
+class SGLKernelExistingRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: int,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+        num_q_heads: int,
+        num_kv_heads: int,
+    ) -> None:
+        super().__init__()
+        if not HAS_SGL_KERNEL_EXISTING:
+            raise RuntimeError("sgl_kernel not available")
+        
+        self.head_size = head_size
+        self.rotary_dim = rotary_dim
+        self.max_position_embeddings = max_position_embeddings
+        self.base = base
+        self.is_neox_style = is_neox_style
+        self.dtype = dtype
+        self.num_q_heads = num_q_heads
+        self.num_kv_heads = num_kv_heads
+
+        cache = self._compute_cos_sin_cache()
+        self.cos_sin_cache: torch.Tensor
+        self.register_buffer("cos_sin_cache", cache, persistent=False)
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = 1.0 / (
+            self.base
+            ** (torch.arange(0, self.rotary_dim, 2, dtype=torch.float32) / self.rotary_dim)
+        )
+        t = torch.arange(self.max_position_embeddings, dtype=torch.float32)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
+
+    def forward_cuda(
+        self,
+        positions: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        offsets: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        num_tokens = positions.shape[0]
+        
+        q = query.view(num_tokens, self.num_q_heads, self.head_size)
+        k = key.view(num_tokens, self.num_kv_heads, self.head_size)
+        
+        q_out = torch.empty_like(q)
+        k_out = torch.empty_like(k)
+        
+        # Call sgl_kernel's existing implementation
+        # requires int64 positions
+        pos_i64 = positions.to(torch.int64)
+        
+        torch.ops.sgl_kernel.apply_rope_pos_ids_cos_sin_cache(
+            q, k, q_out, k_out, self.cos_sin_cache, pos_i64,
+            not self.is_neox_style,  # interleave
+            False,  # enable_pdl
+            0,      # cuda_stream
+            None,   # v
+            None,   # k_buffer
+            None,   # v_buffer
+            None,   # kv_cache_loc
+        )
+        
+        query_out = q_out.view(num_tokens, self.num_q_heads * self.head_size)
+        key_out = k_out.view(num_tokens, self.num_kv_heads * self.head_size)
+        return query_out, key_out
+
+
 def get_available_providers():
-    """获取可用的 provider 列表。"""
     providers = ["flashinfer", "vllm_native", "vllm"]
     names = ["FlashInfer", "vLLM_Native", "vLLM"]
+    
+    if HAS_SGL_KERNEL_EXISTING:
+        providers.append("sgl_existing")
+        names.append("SGL_Existing")
     
     if HAS_ROPE_OPTIMIZED:
         providers.extend(["sgl_opt", "sgl_opt_inplace", "sgl_opt_onthefly"])
@@ -322,10 +382,7 @@ def get_available_providers():
 @triton.testing.perf_report(
     triton.testing.Benchmark(
         x_names=["seq_len"],
-        x_vals=[
-            2, 4, 8, 16, 32, 64, 128, 256, 512, 1024,
-            2048, 4096, 8192, 16384, 32768, 65536,
-        ],
+        x_vals=[i for i in range(1, 1024) if i % 2 == 0],
         line_arg="provider",
         line_vals=get_available_providers()[0],
         line_names=get_available_providers()[1],
@@ -389,6 +446,13 @@ def benchmark(
         ).to(device)
         rope_forward = rope.forward_native
         
+    elif provider == "sgl_existing":
+        rope = SGLKernelExistingRotaryEmbedding(
+            head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype,
+            num_q_heads, num_kv_heads,
+        ).to(device)
+        rope_forward = rope.forward_cuda
+        
     elif provider == "sgl_opt":
         rope = SGLOptimizedRotaryEmbedding(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype,
@@ -430,7 +494,6 @@ def benchmark(
         batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device
     )
 
-    # 测量性能
     measurements = bench_gpu_time(lambda: rope_forward(pos_ids, query, key))
     ms = np.median(measurements)
     min_ms = np.percentile(measurements, 20)
@@ -440,7 +503,6 @@ def benchmark(
 
 
 def correctness_test():
-    """正确性测试：对比各实现的输出。"""
     print("\n" + "=" * 60)
     print("Correctness Test")
     print("=" * 60)
@@ -461,15 +523,11 @@ def correctness_test():
     base = 10000
     is_neox_style = True
     
-    # 创建输入
     pos_ids = torch.arange(seq_len, device=device, dtype=torch.int32).repeat(batch_size)
     query = torch.randn(batch_size * seq_len, num_q_heads * head_size, dtype=dtype, device=device)
     key = torch.randn(batch_size * seq_len, num_kv_heads * head_size, dtype=dtype, device=device)
     
-    # FlashInfer 参考实现
-    fi_rope = FlashInferRotaryEmbedding(
-        head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
-    ).to(device)
+    fi_rope = FlashInferRotaryEmbedding(head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype).to(device)
     q_ref = query.clone()
     k_ref = key.clone()
     fi_rope.forward_cuda(pos_ids, q_ref, k_ref)
@@ -481,7 +539,6 @@ def correctness_test():
     ).to(device)
     q_sgl, k_sgl = sgl_rope.forward_cuda(pos_ids, query.clone(), key.clone())
     
-    # 对比
     q_diff = (q_sgl - q_ref).abs().max().item()
     k_diff = (k_sgl - k_ref).abs().max().item()
     
@@ -496,9 +553,6 @@ def correctness_test():
 
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print("RoPE Benchmark")
-    print("=" * 60)
     
     providers, names = get_available_providers()
     print(f"Available providers: {providers}")
@@ -507,10 +561,8 @@ if __name__ == "__main__":
     print(f"SGL Optimized: {'✓' if HAS_ROPE_OPTIMIZED else '✗'}")
     print(f"SGL Old: {'✓' if HAS_SGL_KERNEL_OLD else '✗'}")
     
-    # 运行正确性测试
     correctness_test()
     
-    # 运行性能测试
     print("\n" + "=" * 60)
     print("Performance Benchmark")
     print("=" * 60)
