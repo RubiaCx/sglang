@@ -153,6 +153,8 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
 
+    enable_sequence_shard: bool = False
+
     def _set_output_file_ext(self):
         # add extension if needed
         if not any(
@@ -365,9 +367,11 @@ class SamplingParams:
                     )
                     logger.warning(error_msg)
 
-        if getattr(pipeline_config, "sp_shard_mode", "frame") == "sequence":
+        if self.enable_sequence_shard:
             self.adjust_frames = False
-            logger.info(f"Sequence parallelism is enabled, disabling frame adjustment")
+            logger.info(
+                f"Sequence dimension shard is enabled, disabling frame adjustment"
+            )
 
         if pipeline_config.task_type.is_image_gen():
             # settle num_frames
@@ -741,6 +745,12 @@ class SamplingParams:
                 "and satisfy model temporal constraints. If disabled, tokens might be padded for SP."
                 "Default: true. Examples: --adjust-frames, --adjust-frames true, --adjust-frames false."
             ),
+        )
+        parser.add_argument(
+            "--enable-sequence-shard",
+            action="store_true",
+            default=SamplingParams.enable_sequence_shard,
+            help="Enable sequence dimension shard with sequence parallelism.",
         )
         return parser
 
