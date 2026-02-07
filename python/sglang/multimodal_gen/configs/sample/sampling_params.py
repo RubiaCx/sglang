@@ -153,9 +153,13 @@ class SamplingParams:
     # if True, suppress verbose logging for this request
     suppress_logs: bool = False
 
+<<<<<<< HEAD
     enable_sequence_shard: bool = False
 
     return_file_paths_only: bool = False
+=======
+    return_file_paths_only: bool = True
+>>>>>>> e5cf29ced (update)
 
     def _set_output_file_ext(self):
         # add extension if needed
@@ -755,9 +759,9 @@ class SamplingParams:
             help="Enable sequence dimension shard with sequence parallelism.",
 
             "--return-file-paths-only",
-            action="store_true",
+            action=StoreBoolean,
             default=SamplingParams.return_file_paths_only,
-            help="If set, only return the file paths instead of the tensors.",
+            help="If set, output file will be saved early to get a performance boost, while output tensors will not be returned.",
         )
         return parser
 
@@ -827,9 +831,6 @@ class SamplingParams:
         else:
             n_tokens = -1
         return n_tokens
-
-    def output_file_path(self):
-        return os.path.join(self.output_path, self.output_file_name)
 
 
 @dataclass
