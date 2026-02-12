@@ -34,6 +34,7 @@ from sglang.srt.layers.parameter import (
     PerTensorScaleParameter,
     RowvLLMParameter,
     _ColumnvLLMParameter,
+    _maybe_narrow_for_presharded_tp,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
@@ -257,7 +258,17 @@ class ReplicatedLinear(LinearBase):
                     param.dtype == loaded_weight.dtype
                 ), "init para dtype and loaded weight dtype should be the same"
 
-        assert param.size() == loaded_weight.size()
+        # Handle pre-sharded checkpoint with smaller TP
+        if param.size() != loaded_weight.size():
+            tp_rank = get_tensor_model_parallel_rank()
+            loaded_weight = _maybe_narrow_for_presharded_tp(
+                param.data, loaded_weight, tp_rank
+            )
+
+        assert param.size() == loaded_weight.size(), (
+            f"ReplicatedLinear weight size mismatch: "
+            f"param={param.size()}, loaded={loaded_weight.size()}"
+        )
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -404,6 +415,12 @@ class ColumnParallelLinear(LinearBase):
                 )
             else:
                 if not self.use_presharded_weights:
+                    loaded_dim_size = loaded_weight.shape[output_dim]
+                    # Handle pre-sharded checkpoint with smaller TP
+                    if start_idx + shard_size > loaded_dim_size and loaded_dim_size >= shard_size:
+                        ratio = loaded_dim_size // shard_size
+                        sub_rank = self.tp_rank % ratio
+                        start_idx = sub_rank * shard_size
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
                     )
@@ -413,6 +430,11 @@ class ColumnParallelLinear(LinearBase):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        # Handle pre-sharded checkpoint for presharded_weights case
+        if param_data.shape != loaded_weight.shape:
+            loaded_weight = _maybe_narrow_for_presharded_tp(
+                param_data, loaded_weight, self.tp_rank
+            )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 

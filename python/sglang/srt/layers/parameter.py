@@ -27,6 +27,47 @@ logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
 
 
+def _maybe_narrow_for_presharded_tp(
+    target: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    tp_rank: int,
+    shard_dim: Optional[int] = None,
+) -> torch.Tensor:
+    """Handle loading weights from a checkpoint that was pre-sharded for a
+    smaller TP size (e.g. checkpoint TP=2 -> runtime TP=4).
+
+    If loaded_weight is larger than target along shard_dim (or an auto-detected
+    dimension), narrow it so each runtime TP rank gets the correct slice.
+
+    Returns the (possibly narrowed) loaded_weight ready for copy.
+    """
+    if target.shape == loaded_weight.shape:
+        return loaded_weight
+
+    dims_to_check = [shard_dim] if shard_dim is not None else range(len(target.shape))
+    for dim in dims_to_check:
+        if dim is None:
+            continue
+        target_size = target.shape[dim]
+        loaded_size = loaded_weight.shape[dim]
+        if loaded_size > target_size and loaded_size % target_size == 0:
+            ratio = loaded_size // target_size
+            sub_rank = tp_rank % ratio
+            narrowed = loaded_weight.narrow(dim, sub_rank * target_size, target_size)
+            # Verify all other dims match
+            if all(
+                narrowed.shape[d] == target.shape[d] for d in range(len(target.shape))
+            ):
+                logger.debug(
+                    f"Auto-narrowed pre-sharded weight: {loaded_weight.shape} -> "
+                    f"{narrowed.shape} (dim={dim}, tp_rank={tp_rank}, sub_rank={sub_rank})"
+                )
+                return narrowed
+
+    # No auto-narrow possible, return as-is (caller will raise the error)
+    return loaded_weight
+
+
 def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
     if dtype in (
         torch.float8_e4m3fn,
@@ -44,11 +85,20 @@ def _dtype_rank(dtype: torch.dtype) -> Optional[int]:
     return None
 
 
-def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
+def copy_with_check(
+    target: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    tp_rank: Optional[int] = None,
+    shard_dim: Optional[int] = None,
+):
     """
     Copy `loaded_weight` into `target` while forbidding downcasts.
     bf16/fp16 share the same rank, and all fp8 variants share the same rank.
     """
+    if target.shape != loaded_weight.shape and tp_rank is not None:
+        loaded_weight = _maybe_narrow_for_presharded_tp(
+            target, loaded_weight, tp_rank, shard_dim
+        )
 
     assert (
         target.shape == loaded_weight.shape
@@ -100,7 +150,11 @@ class BasevLLMParameter(Parameter):
     def weight_loader(self):
         return self._weight_loader
 
-    def _assert_and_load(self, loaded_weight: torch.Tensor):
+    def _assert_and_load(self, loaded_weight: torch.Tensor, tp_rank: int = 0):
+        if self.data.shape != loaded_weight.shape:
+            loaded_weight = _maybe_narrow_for_presharded_tp(
+                self.data, loaded_weight, tp_rank
+            )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
@@ -144,6 +198,15 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     ):
         if not use_presharded_weights:
             shard_size = self.data.shape[self.output_dim]
+            start_idx = tp_rank * shard_size
+            loaded_size = loaded_weight.shape[self.output_dim]
+
+            # Handle pre-sharded checkpoint with smaller TP
+            if start_idx + shard_size > loaded_size:
+                if loaded_size >= shard_size and loaded_size % shard_size == 0:
+                    ratio = loaded_size // shard_size
+                    sub_rank = tp_rank % ratio
+                    start_idx = sub_rank * shard_size
 
             from sglang.srt.model_loader.weight_utils import (
                 narrow_padded_param_and_loaded_weight,
@@ -154,7 +217,7 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                     self.data,
                     loaded_weight,
                     0,  # param_data_start
-                    tp_rank * shard_size,
+                    start_idx,
                     self.output_dim,
                     shard_size,
                 )
@@ -163,10 +226,10 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                 return
             else:
                 loaded_weight = loaded_weight.narrow(
-                    self.output_dim, tp_rank * shard_size, shard_size
+                    self.output_dim, start_idx, shard_size
                 )
 
-        copy_with_check(self.data, loaded_weight)
+        copy_with_check(self.data, loaded_weight, tp_rank=tp_rank, shard_dim=self.output_dim)
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
 
@@ -315,6 +378,13 @@ class RowvLLMParameter(BasevLLMParameter):
                 # Padding for special case like qwen2_5_VL's mlp which is not 8-aligned
                 start_idx = tp_rank * shard_size
                 end_idx = start_idx + shard_size
+                loaded_dim_size = loaded_weight.shape[self.input_dim]
+                # Handle pre-sharded checkpoint with smaller TP
+                if end_idx > loaded_dim_size and loaded_dim_size >= shard_size:
+                    ratio = loaded_dim_size // shard_size
+                    sub_rank = tp_rank % ratio
+                    start_idx = sub_rank * shard_size
+                    end_idx = start_idx + shard_size
                 if end_idx > loaded_weight.shape[self.input_dim]:
                     loaded_weight = pad_or_narrow_weight(
                         loaded_weight, self.input_dim, start_idx, shard_size
@@ -327,6 +397,10 @@ class RowvLLMParameter(BasevLLMParameter):
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
 
+        if self.data.shape != loaded_weight.shape:
+            loaded_weight = _maybe_narrow_for_presharded_tp(
+                self.data, loaded_weight, tp_rank, shard_dim=self.input_dim
+            )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
