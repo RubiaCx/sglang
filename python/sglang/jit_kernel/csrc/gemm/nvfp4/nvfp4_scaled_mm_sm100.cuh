@@ -70,11 +70,7 @@ const dim3 KernelConfigDefault<T>::preferred_cluster(2, 4, 1);
 template <typename T>
 const dim3 KernelConfigDefault<T>::fallback_cluster(2, 1, 1);
 
-// Config(half_t/bfloat16_t) for M > 1024 (e.g. FLUX.2 production shapes)
-// Uses a 1-CTA-wide M cluster to eliminate tail waste when M is not a
-// multiple of 4*tile_M.  For FLUX at 1024px (M≈4352, N=3072), the old
-// dim3(4,4,1) cluster left ~25 % of the last M-wave idle; dim3(1,4,1)
-// gives perfect tiling (4352 = 17*256, 3072 = 12*256 → 51 full clusters).
+// Config(half_t/bfloat16_t) for M > 1024: 1x4 cluster reduces M-tail waste.
 template <typename T>
 struct KernelConfigLargeM {
   using OutputType = T;
