@@ -327,7 +327,9 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         padded_scales = torch.zeros((B, M_padded, K_padded), dtype=scales.dtype)
         padded_scales[:B, :M, :K] = scales
         # Blockwise interleave for CUTLASS TMA layout required by CUTLASS kernel
-        padded_scales = padded_scales.reshape(B, M_padded // 128, 4, 32, K_padded // 4, 4)
+        padded_scales = padded_scales.reshape(
+            B, M_padded // 128, 4, 32, K_padded // 4, 4
+        )
         padded_scales = padded_scales.permute(0, 1, 4, 3, 2, 5)
         padded_scales = padded_scales.contiguous().cuda()
         padded_scales = (
@@ -397,4 +399,3 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         if bias is not None:
             out = out + bias
         return out.view(*output_shape)
-

@@ -155,7 +155,7 @@ template <typename T>
 const dim3 KernelConfigDefault<T>::fallback_cluster(2, 1, 1);
 
 // Config(half_t/bfloat16_t) for M > 1024
-// Uses a 1-CTA-wide M cluster to eliminate tail waste when M is not a multiple of 4*tile_M. 
+// Uses a 1-CTA-wide M cluster to eliminate tail waste when M is not a multiple of 4*tile_M.
 template <typename T>
 struct KernelConfigLargeM {
   using OutputType = T;
